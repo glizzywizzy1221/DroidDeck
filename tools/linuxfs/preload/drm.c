@@ -1,5 +1,5 @@
 /*
- * GEM handle emulation for KGSL and explicitly enabled system-PowerVR sessions.
+ * GEM handle emulation for KGSL, Arm Mali (kbase) and explicitly enabled system-PowerVR sessions.
  *
  * Compositors and Mesa validate or convert dma-bufs with PRIME ioctls on the render node; KGSL
  * has no GEM. Handles only serve as tokens to these callers, so a table of duplicated dma-buf
@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -46,8 +47,14 @@ static uint32_t next_handle = 1;
 static uint32_t next_pvr_handle = PVR_HANDLE_BIT;
 static dev_t kgsl_dev;
 static int kgsl_state; /* 0 unknown, 1 known, -1 absent */
+static dev_t mali_dev;
+static int mali_state; /* 0 unknown, 1 known, -1 absent */
 
-static int is_kgsl(int fd) {
+#ifndef BL_MALI_NODE
+#define BL_MALI_NODE "/dev/mali0"
+#endif
+
+static int is_kgsl_node(int fd) {
   struct stat st;
   pthread_mutex_lock(&lock);
   if (kgsl_state == 0) {
@@ -56,6 +63,28 @@ static int is_kgsl(int fd) {
   }
   pthread_mutex_unlock(&lock);
   return kgsl_state > 0 && fstat(fd, &st) == 0 && S_ISCHR(st.st_mode) && st.st_rdev == kgsl_dev;
+}
+
+/* Arm's Mali kbase driver is a plain character device with no DRM or GEM either. */
+static int mali_present(void) {
+  struct stat st;
+  pthread_mutex_lock(&lock);
+  if (mali_state == 0) {
+    mali_state = stat(BL_MALI_NODE, &st) == 0 && S_ISCHR(st.st_mode) ? 1 : -1;
+    if (mali_state > 0) mali_dev = st.st_rdev;
+  }
+  pthread_mutex_unlock(&lock);
+  return mali_state > 0;
+}
+
+static int is_mali_node(int fd) {
+  struct stat st;
+  return mali_present() && fstat(fd, &st) == 0 && S_ISCHR(st.st_mode) && st.st_rdev == mali_dev;
+}
+
+/* Every caller below asks "does this descriptor have no GEM of its own?": KGSL and Mali both. */
+static int is_kgsl(int fd) {
+  return is_kgsl_node(fd) || is_mali_node(fd);
 }
 
 /* Keep the opt-in separate from GPU detection: manual ICDs must retain native DRM behavior. */
@@ -279,6 +308,79 @@ __attribute__((visibility("hidden"))) int bl_drm_gem_close(int fd, unsigned long
     return 0;
   }
   return 1;
+}
+
+/*
+ * Mali phones have no DRM device, so libdrm's device lookup fails for the render node that a
+ * Mali Vulkan driver reports, and gamescope then refuses to start ("drmGetDeviceFromDevId()
+ * failed"). Ask libdrm first; only when it fails, on a phone that has the Mali node, answer with
+ * a made-up platform device whose render node is the Mali node itself. The answer is one
+ * allocation, as libdrm's own, so drmFreeDevice() can free it. Layout copied from libdrm's
+ * xf86drm.h (drmDevice, drmPlatformBusInfo, drmPlatformDeviceInfo).
+ */
+#define BL_DRM_NODE_PRIMARY 0
+#define BL_DRM_NODE_RENDER 2
+#define BL_DRM_NODE_MAX 3
+#define BL_DRM_BUS_PLATFORM 2
+#define BL_DRM_MAJOR 226
+
+struct bl_drm_platform_bus {
+  char fullname[512];
+};
+struct bl_drm_platform_dev {
+  char **compatible;
+};
+struct bl_drm_device {
+  char **nodes;
+  int available_nodes;
+  int bustype;
+  union { void *pci; void *usb; struct bl_drm_platform_bus *platform; void *host1x; } businfo;
+  union { void *pci; void *usb; struct bl_drm_platform_dev *platform; void *host1x; } deviceinfo;
+};
+
+__attribute__((visibility("default"))) int drmGetDeviceFromDevId(dev_t dev_id, uint32_t flags,
+                                                                struct bl_drm_device **device) {
+  int (*fn)(dev_t, uint32_t, struct bl_drm_device **) =
+      (int (*)(dev_t, uint32_t, struct bl_drm_device **)) real("drmGetDeviceFromDevId");
+  int result = fn ? fn(dev_id, flags, device) : -ENOSYS;
+  if (result == 0 || !device || major(dev_id) != BL_DRM_MAJOR || !mali_present()) return result;
+
+  static const char primary[] = "/dev/dri/card0";
+  const char *render = BL_MALI_NODE;
+  size_t render_len = strlen(render) + 1;
+  size_t size = sizeof(struct bl_drm_device) + BL_DRM_NODE_MAX * sizeof(char *) + sizeof(char *) +
+                sizeof(struct bl_drm_platform_dev) + sizeof(struct bl_drm_platform_bus) +
+                sizeof(primary) + render_len;
+  char *block = calloc(1, size);
+  if (!block) return -ENOMEM;
+
+  struct bl_drm_device *dev = (struct bl_drm_device *) block;
+  char *p = block + sizeof(*dev);
+  char **nodes = (char **) p;
+  p += BL_DRM_NODE_MAX * sizeof(char *);
+  char **compatible = (char **) p; /* an empty, NULL-terminated list */
+  p += sizeof(char *);
+  struct bl_drm_platform_dev *info = (struct bl_drm_platform_dev *) p;
+  p += sizeof(*info);
+  struct bl_drm_platform_bus *bus = (struct bl_drm_platform_bus *) p;
+  p += sizeof(*bus);
+  char *primary_path = p;
+  p += sizeof(primary);
+  char *render_path = p;
+
+  memcpy(primary_path, primary, sizeof(primary));
+  memcpy(render_path, render, render_len);
+  strcpy(bus->fullname, "mali");
+  info->compatible = compatible;
+  nodes[BL_DRM_NODE_PRIMARY] = primary_path;
+  nodes[BL_DRM_NODE_RENDER] = render_path;
+  dev->nodes = nodes;
+  dev->available_nodes = (1 << BL_DRM_NODE_PRIMARY) | (1 << BL_DRM_NODE_RENDER);
+  dev->bustype = BL_DRM_BUS_PLATFORM;
+  dev->businfo.platform = bus;
+  dev->deviceinfo.platform = info;
+  *device = dev;
+  return 0;
 }
 
 /*
